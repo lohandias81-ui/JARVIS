@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Jarvis</title>
+<style>
+:root{--bg:#f5f6fa;--card:#fff;--text:#1d2033;--muted:#6b7090;--accent:#5b5bd6;--line:#dfe1ee;color-scheme:light}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#0f1119;--card:#1a1d2b;--text:#e8e9f5;--muted:#9097b8;--accent:#7f8cff;--line:#2b3046;color-scheme:dark}}
+:root[data-theme="dark"]{--bg:#0f1119;--card:#1a1d2b;--text:#e8e9f5;--muted:#9097b8;--accent:#7f8cff;--line:#2b3046;color-scheme:dark}
+*{box-sizing:border-box}
+body{margin:0;font-family:system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--text);height:100vh;height:100dvh;display:flex;flex-direction:column;padding:env(safe-area-inset-top,0) 12px env(safe-area-inset-bottom,0)}
+header{display:flex;align-items:center;justify-content:space-between;padding:12px 4px}
+header h1{font-size:20px;margin:0;letter-spacing:2px}
+#orb{width:14px;height:14px;border-radius:50%;background:var(--accent);transition:.3s}
+#orb.busy{animation:pulse 1s infinite}
+#orb.speaking{background:#4fd18b}
+@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(127,140,255,.7)}100%{box-shadow:0 0 0 14px rgba(127,140,255,0)}}
+#log{flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:8px;padding:4px}
+.msg{padding:9px 13px;border-radius:14px;max-width:88%;font-size:15px;line-height:1.45;white-space:pre-wrap}
+.bot{background:var(--card);border:1px solid var(--line);align-self:flex-start}
+.me{background:var(--accent);color:#fff;align-self:flex-end}
+.bar{display:flex;gap:6px;padding:10px 0 4px;align-items:center}
+input[type=text]{flex:1;padding:12px;border-radius:12px;border:1px solid var(--line);background:var(--card);color:var(--text);font-size:15px;min-width:0}
+button{border:none;border-radius:12px;background:var(--accent);color:#fff;cursor:pointer;font-size:15px;padding:12px 14px}
+button.mic{width:50px;padding:0;font-size:20px;background:var(--card);color:var(--text);border:1px solid var(--line)}
+button.mic.on{background:#e74c3c;color:#fff;border-color:#e74c3c}
+.chips{display:flex;gap:6px;flex-wrap:wrap;padding:4px 0 8px}
+.chips button{padding:6px 10px;font-size:13px;background:var(--card);color:var(--text);border:1px solid var(--line)}
+.muted{color:var(--muted);font-size:12px;padding:0 4px 6px}
+#overlay{position:fixed;inset:0;background:var(--bg);display:none;flex-direction:column;padding:12px;z-index:5}
+#overlay.on{display:flex}
+#overlay canvas{width:100%;max-width:420px;align-self:center;border-radius:12px;touch-action:none}
+#overlay .top{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
+</style>
+</head>
+<body>
+<header>
+  <h1>JARVIS</h1>
+  <span id="orb"></span>
+</header>
+
+<div id="log"></div>
+
+<div class="chips">
+  <button data-q="Que dia é hoje?">Data</button>
+  <button data-q="Qual a cotação do Bitcoin agora?">Bitcoin</button>
+  <button data-q="Jogar">Jogar</button>
+  <button data-q="Classificar">Classificar</button>
+</div>
+
+<div class="bar">
+  <button class="mic" id="mic" title="Toque para falar">🎤</button>
+  <input type="text" id="msg" placeholder="Pergunte qualquer coisa..." autocomplete="off">
+  <button id="send">Enviar</button>
+</div>
+<p class="muted" id="hint"></p>
+
+<div id="overlay">
+  <div class="top"><strong id="ovTitle"></strong><button id="close">Fechar</button></div>
+  <canvas id="game" width="360" height="360" style="display:none"></canvas>
+  <canvas id="plot" width="360" height="360" style="display:none"></canvas>
+  <p class="muted" id="ovHint"></p>
+</div>
+
+<script>
+const log=document.getElementById("log"), orb=document.getElementById("orb"), hint=document.getElementById("hint");
+const history=[];
+const norm=s=>s.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g,"").replace(/[?!.,]/g,"").trim();
+
+// ================= CAPABILITIES =================
+let sample=null, mcp=null, dict=null;
+async function ns(name){try{return await window.claude.use(name)}catch(e){return null}}
+const ready=(async()=>{
+  sample=await ns("sample"); mcp=await ns("mcp"); dict=await ns("dictation");
+  if(!sample) hint.textContent="Chat de IA indisponível nesta visualização. Os comandos locais continuam funcionando.";
+  setupMic();
+})();
+
+// ================= UI =================
+function add(t,who){const d=document.createElement("div");d.className="msg "+who;d.textContent=t;log.appendChild(d);log.scrollTop=log.scrollHeight;return d}
+function speak(text){
+  if(!("speechSynthesis" in window))return;
+  const u=new SpeechSynthesisUtterance(text);u.lang="pt-BR";
+  u.onstart=()=>orb.classList.add("speaking");u.onend=()=>orb.classList.remove("speaking");
+  speechSynthesis.cancel();speechSynthesis.speak(u);
+}
+
+// ================= FERRAMENTAS (Jarvis pode chamá-las) =================
+const tools=[
+  {name:"cotacao_cripto",
+   description:"Cotação atual de criptomoedas pelo CoinGecko: preço em USD, variação em 24h e valor de mercado. Use ids do CoinGecko, por exemplo bitcoin ou ethereum.",
+   inputSchema:{type:"object",properties:{ids:{type:"array",items:{type:"string"}}},required:["ids"]},
+   execute:async({ids})=>{
+     if(!mcp)return{erro:"conector CoinGecko indisponível"};
+     try{
+       const r=await mcp.callTool("CoinGecko","get-coin-markets",{ids});
+       const coins=(r.payload&&r.payload.coins)||[];
+       return coins.map(c=>({nome:c.name,simbolo:c.symbol,preco_usd:c.currentPrice,variacao_24h_pct:c.priceChangePercentage24h,valor_mercado_usd:c.marketCap,ranking:c.marketCapRank}));
+     }catch(e){return{erro:e.code==="consent_required"||e.code==="server_not_connected"?"conector CoinGecko não conectado":"falha ao consultar"}}
+   }}
+];
+
+// ================= CHAT =================
+const SYSTEM=()=>`Você é o Jarvis, um assistente em português do Brasil. Responda qualquer pergunta com clareza, honestidade e um tom natural.
+Data e hora atuais: ${new Date().toLocaleString("pt-BR",{dateStyle:"full",timeStyle:"short"})}.
+Você não navega na internet nesta página. Nunca diga que pesquisou ou verificou algo que não verificou.
+Para preços, notícias, cargos e placares, avise que a informação pode estar desatualizada, e use a ferramenta de cotação quando ela servir.
+Ao analisar uma notícia ou afirmação, avalie sinais de desinformação (fonte desconhecida, manchete sensacionalista, falta de data ou autor, dados sem origem, pedido urgente para compartilhar), explique o que dá para avaliar e o que não dá, e indique checar em agências como Aos Fatos, Lupa e Estadão Verifica e na fonte original. Não invente fatos, números, citações ou links.
+Sobre finanças, dê informação e riscos, nunca uma ordem de compra ou venda.
+
+PRINCÍPIOS DO PROJETO ATLAS (siga sempre):
+- Não tente só parecer inteligente. Priorize respostas verificáveis, com evidências claras.
+- Informe o nível de certeza: fato confirmado, evidência limitada, hipótese ou não verificado. Se não souber, diga que não sabe. Se errar, corrija sem justificar a resposta errada.
+- Antes de respostas importantes, confira internamente: tenho evidência suficiente? a informação pode estar desatualizada? estou tratando hipótese como fato? há fonte primária ou independente? a conclusão decorre mesmo das evidências? há limitação a informar?
+- Nunca invente citações, links, estatísticas, resultados de testes, experimentos, publicações ou capacidades técnicas.
+- Quando houver fontes conflitantes, apresente o conflito em vez de escolher uma em silêncio.
+- Saúde: priorize diretrizes e revisões científicas, diferencie correlação de causalidade, não trate relatos de redes sociais como evidência e não faça diagnóstico.
+- História: separe fatos documentados, interpretações historiográficas e hipóteses. Não trate todas as interpretações como igualmente fundamentadas.
+- Matemática: identifique os dados e a incógnita, escolha o método e explique por quê, resolva passo a passo e confira o resultado por outro método quando possível.
+- Educação: não entregue só a resposta. Explique o fundamento, adapte a explicação ao nível da pessoa e aponte com precisão onde ela errou.
+- Programação e jogos: prefira mudanças pequenas, testáveis e reversíveis. Não diga que testou ou executou algo que você não executou. Não otimize por suposição.
+- Comparação entre IAs: não declare uma vencedora absoluta. Aponte especialidades, pontos fortes e limitações de cada uma.
+- Previsões nunca são apresentadas como fatos.
+- Limites desta página: você não navega na internet, não pesquisa no Google, não guarda memória entre visitas e não altera seus próprios parâmetros. Se pedirem isso, diga que essa função só existe no chat com o Claude e ofereça o que dá para fazer agora.`;
+
+let busy=false;
+async function ask(text){
+  if(busy||!text.trim())return;
+  add(text,"me");
+  history.push({role:"user",content:text});
+  const bubble=add("Pensando...","bot");
+  orb.classList.add("busy");busy=true;
+  try{
+    if(!sample) throw new Error("sem sample");
+    const msgs=[{role:"user",content:SYSTEM()+"\n\nConversa até aqui:\n"+history.slice(-12).map(m=>(m.role==="user"?"Usuário: ":"Jarvis: ")+m.content).join("\n")+"\n\nResponda à última mensagem do usuário."}];
+    const res=await sample(msgs,{tools,modelTier:"default",onText:({text})=>{bubble.textContent=text;log.scrollTop=log.scrollHeight}});
+    const answer=(res&&res.text)||bubble.textContent||"Não consegui responder agora.";
+    bubble.textContent=answer;history.push({role:"assistant",content:answer});
+    speak(answer);
+  }catch(e){
+    bubble.textContent=localReply(text)||"A IA não está disponível nesta visualização. Tente abrir a página em outro lugar ou digite um comando local: hora, jogar ou classificar.";
+  }finally{busy=false;orb.classList.remove("busy")}
+}
+function localReply(t){
+  const s=norm(t);
+  if(/\b(que dia|data de hoje|dia e hoje|que dia e hoje)\b/.test(s)) return "Hoje é "+new Date().toLocaleDateString("pt-BR",{weekday:"long",day:"numeric",month:"long",year:"numeric"})+".";
+  if(/\b(que horas|hora)\b/.test(s)) return "Agora são "+new Date().toLocaleTimeString("pt-BR",{hour:"2-digit",minute:"2-digit"})+".";
+  return null;
+}
+function route(t){
+  const s=norm(t);
+  if(/\bjogar\b|\bjogo\b/.test(s)){openOverlay("game");return ask(t)&&null}
+  if(/\bclassificar\b|\bclassificador\b/.test(s)){openOverlay("plot");return null}
+  return ask(t);
+}
+function submit(t){ if(!t.trim())return; const l=localReply(t); if(l&&!sample){add(t,"me");add(l,"bot");speak(l);return} route(t); }
+
+document.getElementById("send").onclick=()=>{const i=document.getElementById("msg");submit(i.value);i.value=""};
+document.getElementById("msg").addEventListener("keydown",e=>{if(e.key==="Enter")document.getElementById("send").click()});
+document.querySelectorAll(".chips button").forEach(b=>b.onclick=()=>submit(b.dataset.q));
+
+// ================= VOZ (dictation) =================
+const micBtn=document.getElementById("mic");
+function setupMic(){
+  if(!dict){micBtn.onclick=()=>add("Voz indisponível neste navegador. Digite a pergunta.","bot");return}
+  dict.onFinal(({text})=>{submit(text.replace(/^jarvis[,\s]*/i,""))});
+  dict.onState(({state})=>micBtn.classList.toggle("on",state==="listening"));
+  micBtn.onclick=()=>{dict.start().catch(()=>{})};
+}
+
+// ================= JOGO DE NPCs =================
+const cv=document.getElementById("game"),g=cv.getContext("2d"),W=360,H=360;
+let player,guards,alive,score,keys={},target,mode=null,raf=null;
+function resetGame(){
+  player={x:180,y:180,r:10,speed:2.2,hp:3};
+  guards=[];for(let i=0;i<3;i++){const x=60+Math.random()*240,y=60+Math.random()*240;guards.push({x,y,bx:x,by:y,r:11,state:"patrol",pt:null,pause:0,cool:0})}
+  alive=true;score=0;target=null;
+}
+const SEE=110,ATTACK=18,dist=(a,b)=>Math.hypot(a.x-b.x,a.y-b.y);
+function stepGuard(gd){
+  const d=dist(gd,player);
+  if(d<SEE&&gd.state!=="attack")gd.state="chase";
+  if(d>SEE*1.4&&gd.state==="chase")gd.state="patrol";
+  if(gd.state==="chase"&&d<ATTACK)gd.state="attack";
+  if(gd.state==="attack"&&d>ATTACK*1.5)gd.state="chase";
+  let tx,ty,sp=0.9;
+  if(gd.state==="patrol"){
+    if(!gd.pt||dist(gd,gd.pt)<4){
+      if(gd.pause>0){gd.pause--;return}
+      gd.pt={x:Math.max(20,Math.min(W-20,gd.bx+(Math.random()-0.5)*140)),y:Math.max(20,Math.min(H-20,gd.by+(Math.random()-0.5)*140))};
+      gd.pause=(Math.random()*60)|0;
+    }
+    tx=gd.pt.x;ty=gd.pt.y;
+  }else if(gd.state==="chase"){tx=player.x;ty=player.y;sp=1.4}
+  else{tx=player.x;ty=player.y;sp=0;if(gd.cool--<=0){player.hp--;gd.cool=50;if(player.hp<=0)alive=false}}
+  const a=Math.atan2(ty-gd.y,tx-gd.x);gd.x+=Math.cos(a)*sp;gd.y+=Math.sin(a)*sp;
+}
+function updateGame(){
+  if(!alive)return;
+  let dx=0,dy=0;
+  if(keys.ArrowLeft)dx--;if(keys.ArrowRight)dx++;if(keys.ArrowUp)dy--;if(keys.ArrowDown)dy++;
+  if(target){if(dist(player,target)>3){dx=target.x-player.x;dy=target.y-player.y}else target=null}
+  const m=Math.hypot(dx,dy)||1;
+  if(dx||dy){player.x+=dx/m*player.speed;player.y+=dy/m*player.speed}
+  player.x=Math.max(player.r,Math.min(W-player.r,player.x));player.y=Math.max(player.r,Math.min(H-player.r,player.y));
+  guards.forEach(stepGuard);score++;
+}
+function drawGame(){
+  g.fillStyle="#0b3d2e";g.fillRect(0,0,W,H);
+  g.fillStyle="#1e5c44";for(let i=0;i<20;i++)g.fillRect((i*37)%W,(i*71)%H,6,6);
+  guards.forEach(gd=>{
+    g.fillStyle=gd.state==="patrol"?"#e8c547":gd.state==="chase"?"#f08a24":"#e74c3c";
+    g.beginPath();g.arc(gd.x,gd.y,gd.r,0,Math.PI*2);g.fill();
+    g.fillStyle="#fff";g.font="10px sans-serif";g.textAlign="center";g.fillText(gd.state,gd.x,gd.y-16);
+  });
+  g.fillStyle="#7ad7ff";g.beginPath();g.arc(player.x,player.y,player.r,0,Math.PI*2);g.fill();
+  document.getElementById("ovHint").textContent=alive?`Vida: ${"❤".repeat(player.hp)}   Tempo: ${(score/60).toFixed(0)}s`:"Fim de jogo: toque para recomeçar";
+}
+cv.addEventListener("pointerdown",e=>{
+  if(!alive){resetGame();return}
+  const r=cv.getBoundingClientRect();target={x:(e.clientX-r.left)*W/r.width,y:(e.clientY-r.top)*H/r.height};
+});
+document.addEventListener("keydown",e=>{keys[e.key]=true});
+document.addEventListener("keyup",e=>{keys[e.key]=false});
+
+// ================= CLASSIFICADOR kNN =================
+const pc=document.getElementById("plot"),pg=pc.getContext("2d");
+let samples=[];const COLORS=["#e66","#6a6"];
+function classify(x,y,k=3){
+  if(!samples.length)return -1;
+  const s=samples.map(p=>({d:Math.hypot(p.x-x,p.y-y),c:p.c})).sort((a,b)=>a.d-b.d).slice(0,Math.min(k,samples.length));
+  const v=[0,0];s.forEach(p=>v[p.c]++);return v[0]>=v[1]?0:1;
+}
+function drawPlot(){
+  const step=12;
+  for(let x=0;x<W;x+=step)for(let y=0;y<H;y+=step){
+    const c=classify(x+step/2,y+step/2);
+    pg.fillStyle=c<0?"#1a1d2b":(c===0?"rgba(230,102,102,0.25)":"rgba(102,170,102,0.25)");
+    pg.fillRect(x,y,step,step);
+  }
+  samples.forEach(s=>{pg.fillStyle=COLORS[s.c];pg.beginPath();pg.arc(s.x,s.y,6,0,Math.PI*2);pg.fill()});
+}
+pc.addEventListener("pointerdown",e=>{
+  const r=pc.getBoundingClientRect();
+  samples.push({x:(e.clientX-r.left)*W/r.width,y:(e.clientY-r.top)*H/r.height,c:samples.length%2});
+  drawPlot();
+});
+
+// ================= OVERLAY =================
+function openOverlay(m){
+  mode=m;document.getElementById("overlay").classList.add("on");
+  cv.style.display=m==="game"?"block":"none";pc.style.display=m==="plot"?"block":"none";
+  document.getElementById("ovTitle").textContent=m==="game"?"Jogo de NPCs":"Classificador kNN";
+  if(m==="game"){resetGame();loop()}
+  else{samples=[];pg.fillStyle="#1a1d2b";pg.fillRect(0,0,W,H);drawPlot();document.getElementById("ovHint").textContent="Toque para adicionar exemplos (classes alternam)"}
+}
+function loop(){if(mode!=="game")return;updateGame();drawGame();raf=requestAnimationFrame(loop)}
+document.getElementById("close").onclick=()=>{document.getElementById("overlay").classList.remove("on");mode=null;if(raf)cancelAnimationFrame(raf)};
+
+// ================= INÍCIO =================
+add("Olá, sou o Jarvis. Pergunte qualquer coisa, por voz ou digitando.","bot");
+</script>
+</body>
+</html>
